@@ -1,6 +1,7 @@
 import os
 import sys
 import torch
+import json                  # Added: To pretty-print the judge results
 from dotenv import load_dotenv
 
 # Load variables from .env file
@@ -16,9 +17,12 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import requests
 import chromadb
 from sentence_transformers import SentenceTransformer
+
+# ── Google GenAI SDK Import ─────────────────────────────────────────────────
+from google import genai
+from google.genai import types
 
 # ── LangGraph & LangChain Imports ───────────────────────────────────────────
 from typing import Annotated, TypedDict
@@ -27,10 +31,13 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 
-# ── OpenRouter (LLM — cloud, no local GPU needed) ───────────────────────────
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL   = "qwen/qwen-2.5-7b-instruct"
+# ── Imported Judge Function ─────────────────────────────────────────────────
+from judge import evaluate_response # Added: Connects this main loop to judge.py
+
+# ── Direct Gemini API Initialization ────────────────────────────────────────
+# The client automatically uses os.environ.get("GEMINI_API_KEY")
+gemini_client = genai.Client()
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
 # ── 1. Define LangGraph State ───────────────────────────────────────────────
@@ -54,14 +61,17 @@ class PedagogicalAgentGraph:
 
         # ── System prompt ────────────────────────────────────────────────
         self.system_prompt = (
-            "أنت معلم وميسر تعليمي ذكي، صبور، ومشجع اسمك 'بصيرة'. "
-            "مهمتك هي تعليم الطلاب باستخدام اللهجة المصرية العامية البسيطة والواضحة. "
-            "التزم بالقواعد دي:\n"
-            "1. ممنوع تماماً أي كلمة إنجليزية في ردك — كل حاجة بالعربي المصري.\n"
-            "2. اتكلم بأسلوب مصري ودي (مثل: 'يا بطل'، 'بص يا سيدي'، 'تمام؟'، 'خد بالك').\n"
-            "3. أسلوبك يكون تفاعلي ومشجع دايماً.\n"
-            "4. اجعل جملك قصيرة ومرتبة — الطالب بيسمعك صوتياً فقط.\n"
-            "5. بعد الشرح، اسأل سؤال بسيط باللهجة المصرية تتأكد إن الطالب فاهم."
+            "أنت معلمة اسمك 'بصيرة'. مهمتك تشرحي المواضيع للأطفال بالعربي المصري الواضح والبسيط.\n\n"
+
+            "قواعد لازم تتبعيها:\n"
+            "1. ممنوع أي كلمة إنجليزية — كل حاجة بالعربي المصري فقط.\n"
+            "2. اشرحي بالتفصيل: مش أقل من 6 جمل في الشرح.\n"
+            "3. استخدمي المعلومات اللي في السياق التعليمي المقدم لك بدقة — لا تخترعي معلومات.\n"
+            "4. قاعدة علمية مهمة: النباتات بتصنع أكلها بنفسها من ضوء الشمس عن طريق البناء الضوئي. "
+            "البشر مش بياكلوا ضوء الشمس — ممنوع تقولي كده. لو بتشبهي النبات بالبشر, قولي: "
+            "'بدل الأكل اللي بياكله البشر، النبات بيعمل أكله بنفسه من الضوء'.\n"
+            "5. اتكلمي بأسلوب مصري دافي (مثل: 'يا بطل'، 'بص يا سيدي'، 'خد بالك').\n"
+            "6. في آخر ردك، اسألي سؤال بسيط بالمصري عشان تتأكدي إن الطالب فاهم."
         )
         
         # ── Compile LangGraph Pipeline ───────────────────────────────────
@@ -92,7 +102,7 @@ class PedagogicalAgentGraph:
 
     # ── 2. LangGraph Node Function ──────────────────────────────────────────
     def call_model(self, state: AgentState) -> dict:
-        """Processes the state, injects RAG context, and hits OpenRouter API."""
+        """Processes the state, injects RAG context, and hits native Gemini API."""
         
         # Get the latest question from the user
         last_user_message = [msg for msg in state["messages"] if isinstance(msg, HumanMessage)][-1]
@@ -101,53 +111,43 @@ class PedagogicalAgentGraph:
         # Retrieve context matching the user's latest input
         retrieved_context = self.retrieve_knowledge(user_query)
 
-        # Build formatted context wrapper
-        if retrieved_context:
-            context_wrapper = (
-                f"السياق التعليمي المتوفر من قاعدة البيانات:\n{retrieved_context}\n\n"
-                f"موضوع الطالب او سؤاله الحالي: "
-            )
-        else:
-            context_wrapper = (
-                f"ملحوظة: مفيش معلومات متوفرة في قاعدة البيانات عن الموضوع ده.\n\n"
-                f"موضوع الطالب او سؤاله الحالي: "
-            )
+        # ── Build the Native Gemini Contents list ───────────────────────────
+        contents = []
 
-        # Standardize message structures to build the full history payload
-        payload_messages = [{"role": "system", "content": self.system_prompt}]
-        
-        for msg in state["messages"]:
+        # Append full conversation history (all turns except the current one)
+        for msg in state["messages"][:-1]:
             if isinstance(msg, HumanMessage):
-                # Only inject the RAG wrapper onto the last message to avoid polluting history
-                if msg == last_user_message:
-                    payload_messages.append({"role": "user", "content": f"{context_wrapper}{msg.content}"})
-                else:
-                    payload_messages.append({"role": "user", "content": msg.content})
+                contents.append(types.Content(role="user", parts=[types.Part.from_text(text=msg.content)]))
             elif isinstance(msg, AIMessage):
-                payload_messages.append({"role": "assistant", "content": msg.content})
+                contents.append(types.Content(role="model", parts=[types.Part.from_text(text=msg.content)]))
 
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type":  "application/json",
-        }
-        payload = {
-            "model": OPENROUTER_MODEL,
-            "messages": payload_messages,
-        }
+        # Inject RAG context right before the current question as user context
+        if retrieved_context:
+            context_text = (
+                "السياق التعليمي التالي مأخوذ من قاعدة بيانات المنهج — استخدميه بدقة في شرحك:\n\n"
+                f"{retrieved_context}"
+            )
+            contents.append(types.Content(role="user", parts=[types.Part.from_text(text=context_text)]))
+
+        # Add the current user question
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_query)]))
+
+        # Configure system instructions and parameters
+        config = types.GenerateContentConfig(
+            system_instruction=self.system_prompt,
+            temperature=0.7
+        )
 
         try:
-            print(f"LOG: Calling OpenRouter ({OPENROUTER_MODEL}) with conversation history...")
-            response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            ai_reply = response.json()["choices"][0]["message"]["content"]
-        except requests.exceptions.Timeout:
-            ai_reply = "خطأ: OpenRouter ما ردتش في الوقت المطلوب. جرب تاني."
-        except requests.exceptions.ConnectionError:
-            ai_reply = "خطأ: مش قادر اتصل بـ OpenRouter. تاكد من الانترنت."
-        except requests.exceptions.HTTPError as e:
-            ai_reply = f"خطأ HTTP: {e} — {response.text[:300]}"
-        except (KeyError, ValueError) as e:
-            ai_reply = f"خطأ في معالجة الرد: {e}"
+            print(f"LOG: Calling Native Gemini API ({GEMINI_MODEL}) with conversation history...")
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=config,
+            )
+            ai_reply = response.text
+        except Exception as e:
+            ai_reply = f"خطأ في الاتصال بـ Gemini API: {e}"
 
         # Return the new AI message back to the LangGraph state
         return {"messages": [AIMessage(content=ai_reply)]}
@@ -172,7 +172,7 @@ class PedagogicalAgentGraph:
 if __name__ == "__main__":
     print("=" * 60)
     print("  BASIRA - المعلم الذكي بالمصري (مع LangGraph Memory)")
-    print(f"  LLM : {OPENROUTER_MODEL} (OpenRouter)")
+    print(f"  LLM : {GEMINI_MODEL} (Native Google API)")
     print("  RAG : intfloat/multilingual-e5-large (local CPU)")
     print("=" * 60 + "\n")
 
@@ -214,3 +214,25 @@ if __name__ == "__main__":
         print("[BASIRA]:")
         print(final_response)
         print("=" * 60 + "\n")
+
+        # ── 🛡️ RUN LLM-AS-A-JUDGE EVALUATION ──────────────────────────────────
+        print("LOG: Evaluating response with Llama-3.3-70b-Instruct...")
+        
+        # Pull matching context reference information used for this round
+        rag_context_extracted = ""
+        if tutor.collection.count() > 0:
+            rag_context_extracted = tutor.retrieve_knowledge(user_input)
+        
+        # Trigger judge file validation engine
+        evaluation = evaluate_response(
+            user_query=user_input,
+            rag_context=rag_context_extracted,
+            assistant_response=final_response
+        )
+        
+        # Print the finalized report structure
+        print("═" * 50)
+        print("🛡️  [JUDGE EVALUATION REPORT]")
+        print("═" * 50)
+        print(json.dumps(evaluation, indent=2, ensure_ascii=False))
+        print("═" * 50 + "\n")
