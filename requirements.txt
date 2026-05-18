@@ -1,0 +1,7 @@
+mazinger[transcribe-faster]
+mazinger[transcribe-whisperx]
+transformers
+gradio
+soundfile
+scipy
+
